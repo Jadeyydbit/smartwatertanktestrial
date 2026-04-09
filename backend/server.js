@@ -34,6 +34,11 @@ const requireAuth = (req, res, next) => {
 // 🔥 GLOBAL STATE
 let motorState = false
 
+// Basic response for browser checks
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'smart-tank-backend' })
+})
+
 // 🔹 CURRENT STATUS (for frontend)
 app.get('/api/current', (req, res) => {
   res.json({
@@ -44,23 +49,31 @@ app.get('/api/current', (req, res) => {
 
 // 🔹 HISTORY (still works with DB)
 app.get('/api/history', async (req, res) => {
-  const data = await Reading.find().sort({ time: -1 }).limit(50)
-  res.json(data)
+  try {
+    const data = await Reading.find().sort({ time: -1 }).limit(50)
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load history', message: err.message })
+  }
 })
 
 // 🔹 ANALYTICS (simplified)
 app.get('/api/analytics', async (req, res) => {
-  const records = await Reading.find()
+  try {
+    const records = await Reading.find()
 
-  const timesMotorOn = records.filter(r => r.motor === "ON").length
+    const timesMotorOn = records.filter(r => r.motor === "ON").length
 
-  res.json({
-    avgLevel: 0,
-    maxLevel: 0,
-    minLevel: 0,
-    timesMotorOn,
-    motorRunning: motorState
-  })
+    res.json({
+      avgLevel: 0,
+      maxLevel: 0,
+      minLevel: 0,
+      timesMotorOn,
+      motorRunning: motorState
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load analytics', message: err.message })
+  }
 })
 
 // 🔥 MAIN: MOTOR CONTROL (MOST IMPORTANT) - REQUIRES AUTH
