@@ -1,200 +1,109 @@
-require('./db')
+require('dotenv').config() // Load environment variables
+
+// Try to connect to MongoDB but don't block server startup
+try {
+  require('./db')
+  console.log("MongoDB connection initiated...")
+} catch (err) {
+  console.warn("⚠️  MongoDB not available (motor control still works):", err.message)
+}
+
 const Reading = require('./models/reading')
 const express = require('express')
 const cors = require('cors')
-const fetch = require('node-fetch')
+// Use native fetch (Node 18+) - no need for node-fetch
 
 const app = express()
 app.use(cors())
 app.use(express.json())
 
-const ESP32_IP = "http://192.168.1.10"
+// 🔐 ENVIRONMENT CONFIG
+const PORT = process.env.PORT || 3000
+const ESP32_IP = process.env.ESP32_IP || "http://192.168.0.101"
+const API_TOKEN = process.env.API_TOKEN || "dev-token-change-in-production"
+
+// 🔑 AUTH MIDDLEWARE: Check API token on sensitive endpoints
+const requireAuth = (req, res, next) => {
+  const token = req.headers['x-api-token'] || req.query.token
+  if (token !== API_TOKEN) {
+    return res.status(401).json({ error: 'Unauthorized', message: 'Invalid API token' })
+  }
+  next()
+}
 
 // 🔥 GLOBAL STATE
-let currentLevel = 0
 let motorState = false
 
-let history = []
-let motorStartedAt = null
-let runtimeSessions = []
-
-function setMotorState(nextState) {
-const now = Date.now()
-
-if (nextState && !motorState) {
-motorStartedAt = now
-}
-
-if (!nextState && motorState && motorStartedAt !== null) {
-const durationSeconds = (now - motorStartedAt) / 1000
-
-runtimeSessions.push({
-  startedAt: new Date(motorStartedAt).toISOString(),
-  endedAt: new Date(now).toISOString(),
-  durationSeconds: Math.round(durationSeconds)
-})
-
-if (runtimeSessions.length > 30) {
-  runtimeSessions = runtimeSessions.slice(-30)
-}
-
-motorStartedAt = null
-
-}
-
-motorState = nextState
-}
-
-function getCurrentMotorRuntimeSeconds() {
-if (motorState && motorStartedAt !== null) {
-return (Date.now() - motorStartedAt) / 1000
-}
-return 0
-}
-
-// 🔥 REALISTIC TANK SIMULATION (NO DB SAVE HERE)
-async function fetchData() {
-
-if (motorState) {
-currentLevel += 2   // filling
-} else {
-currentLevel -= 0.3 // usage
-}
-
-if (currentLevel > 100) currentLevel = 100
-if (currentLevel < 0) currentLevel = 0
-
-console.log("Level:", Math.round(currentLevel), "| Motor:", motorState ? "ON" : "OFF")
-}
-
-// 🔹 RUN EVERY 5 SEC
-setInterval(fetchData, 5000)
-
-// 🔹 CURRENT DATA
+// 🔹 CURRENT STATUS (for frontend)
 app.get('/api/current', (req, res) => {
-res.json({
-level: Math.round(currentLevel),
-motor: motorState
-})
+  res.json({
+    motor: motorState,
+    level: 0 // dummy since no sensor
+  })
 })
 
-// 🔹 HISTORY FROM DATABASE
+// 🔹 HISTORY (still works with DB)
 app.get('/api/history', async (req, res) => {
-const data = await Reading.find().sort({ time: -1 }).limit(50)
-res.json(data)
+  const data = await Reading.find().sort({ time: -1 }).limit(50)
+  res.json(data)
 })
 
-// 🔹 ANALYTICS
+// 🔹 ANALYTICS (simplified)
 app.get('/api/analytics', async (req, res) => {
-const records = await Reading.find().sort({ time: 1 }).limit(500)
+  const records = await Reading.find()
 
-if (!records.length) {
-return res.json({
-avgLevel: 0,
-maxLevel: 0,
-minLevel: 0,
-timesMotorOn: 0,
-motorRuntime: Math.round(getCurrentMotorRuntimeSeconds()),
-motorRuntimeCurrent: Math.round(getCurrentMotorRuntimeSeconds()),
-motorRuntimeTotal: 0,
-motorRunning: motorState,
-runtimeLog: runtimeSessions.slice(-8).reverse()
-})
-}
+  const timesMotorOn = records.filter(r => r.motor === "ON").length
 
-const levels = records
-.map((item) => Number(item.level))
-.filter((value) => Number.isFinite(value))
-
-const avg = levels.length
-? Math.round(levels.reduce((a, b) => a + b, 0) / levels.length)
-: 0
-
-const timesMotorOn = records.filter((item) => String(item.motor).toUpperCase() === 'ON').length
-
-let activeStart = null
-const dbSessions = []
-
-for (const item of records) {
-const state = String(item.motor).toUpperCase()
-const itemTime = new Date(item.time)
-
-if (Number.isNaN(itemTime.getTime())) {
-continue
-}
-
-if (state === 'ON' && activeStart === null) {
-activeStart = itemTime
-continue
-}
-
-if (state === 'OFF' && activeStart !== null) {
-const durationSeconds = Math.max(0, Math.round((itemTime.getTime() - activeStart.getTime()) / 1000))
-
-dbSessions.push({
-startedAt: activeStart.toISOString(),
-endedAt: itemTime.toISOString(),
-durationSeconds
+  res.json({
+    avgLevel: 0,
+    maxLevel: 0,
+    minLevel: 0,
+    timesMotorOn,
+    motorRunning: motorState
+  })
 })
 
-activeStart = null
-}
-}
+// 🔥 MAIN: MOTOR CONTROL (MOST IMPORTANT) - REQUIRES AUTH
+app.post('/api/motor/:state', requireAuth, async (req, res) => {
+  const state = req.params.state
+  const shouldTurnOn = state === 'on'
 
-const currentRuntime = Math.round(getCurrentMotorRuntimeSeconds())
-const lastCompletedRuntime = dbSessions.length ? dbSessions[dbSessions.length - 1].durationSeconds : 0
-const totalCompletedRuntime = dbSessions.reduce((sum, item) => sum + item.durationSeconds, 0)
-const totalRuntime = totalCompletedRuntime + currentRuntime
+  // ✅ update local state
+  motorState = shouldTurnOn
 
-res.json({
-avgLevel: avg,
-maxLevel: levels.length ? Math.max(...levels) : 0,
-minLevel: levels.length ? Math.min(...levels) : 0,
-timesMotorOn,
-motorRuntime: motorState ? currentRuntime : lastCompletedRuntime,
-motorRuntimeCurrent: currentRuntime,
-motorRuntimeTotal: totalRuntime,
-motorRunning: motorState,
-runtimeLog: dbSessions.slice(-8).reverse()
-})
-})
+  console.log("Motor:", shouldTurnOn ? "ON" : "OFF")
 
-// 🔥 MOTOR CONTROL (ONLY PLACE WE SAVE DATA)
-app.post('/api/motor/:state', async (req, res) => {
-const state = req.params.state
-const shouldTurnOn = state === 'on'
+  // Try to save to DB, but don't fail motor control if it errors
+  const record = {
+    level: 0,
+    motor: shouldTurnOn ? "ON" : "OFF",
+    time: new Date()
+  }
 
-setMotorState(shouldTurnOn)
+  try {
+    await Reading.create(record)
+  } catch (dbErr) {
+    console.warn("DB save error (motor control still works):", dbErr.message)
+  }
 
-const record = {
-level: Math.round(currentLevel),
-motor: shouldTurnOn ? "ON" : "OFF",
-time: new Date()
-}
+  try {
+    // 🔥 CONTROL ESP32
+    await fetch(`${ESP32_IP}/control?state=${state}`)
 
-// 🔥 SAVE ONLY HERE
-await Reading.create(record)
+    res.json({
+      success: true,
+      motor: motorState
+    })
 
-history.push(record)
-if (history.length > 100) history.shift()
+  } catch (err) {
+    console.log("ESP32 error:", err.message)
 
-console.log("Event Saved:", record)
-
-try {
-await fetch(`${ESP32_IP}/motor/${state}`)
-res.json({
-success: true,
-motor: motorState,
-level: Math.round(currentLevel)
-})
-} catch {
-res.json({
-success: false,
-motor: motorState,
-level: Math.round(currentLevel),
-message: "ESP32 not connected (simulation mode)"
-})
-}
+    res.json({
+      success: false,
+      motor: motorState,
+      message: "ESP32 not reachable"
+    })
+  }
 })
 
-app.listen(3000, () => console.log("Backend running on http://localhost:3000"))
+app.listen(PORT, () => console.log(`Backend running on http://localhost:${PORT}`))

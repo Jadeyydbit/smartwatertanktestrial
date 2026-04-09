@@ -1,177 +1,252 @@
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+// 🌐 CLOUD BACKEND CONFIG
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3000"
+const API_TOKEN = import.meta.env.VITE_API_TOKEN || "dev-token-change-in-production"
 
-// 🔹 SWITCHES
-const USE_BACKEND = true   // ✅ turn ON for backend
-const BASE_URL = "http://localhost:3000/api"
+// 📡 Legacy ESP32 direct connection (fallback)
+const BASE_URL = import.meta.env.VITE_ESP32_BASE_URL || "/esp32"
+const DATA_URL = `${BASE_URL}/data`
+const DEVICE_CACHE_TTL_MS = 700
+const ESP32_FETCH_TIMEOUT_MS = 2500
 
-// 🔹 FALLBACK (old system)
-const USE_REAL_API = false
-const ESP32_IP = "http://192.168.1.10"
+let deviceDataCache = null
+let lastDeviceFetchAt = 0
+let inFlightDeviceFetch = null
+let consecutiveFetchFailures = 0
+let nextFetchRetryAt = 0
 
-// 🔹 LOCAL MEMORY (fallback only)
-let historyStore = []
+async function fetchDeviceData({ force = false } = {}) {
+  const now = Date.now()
+
+  if (!force && deviceDataCache && now - lastDeviceFetchAt < DEVICE_CACHE_TTL_MS) {
+    return deviceDataCache
+  }
+
+  if (!force && now < nextFetchRetryAt) {
+    if (deviceDataCache) return deviceDataCache
+    throw new Error('ESP32 temporarily unreachable, retrying soon')
+  }
+
+  if (!force && inFlightDeviceFetch) {
+    return inFlightDeviceFetch
+  }
+
+  inFlightDeviceFetch = (async () => {
+    const controller = new AbortController()
+    const timeoutHandle = setTimeout(() => controller.abort(), ESP32_FETCH_TIMEOUT_MS)
+
+    try {
+      // 🌐 Call backend API instead of ESP32 directly
+      const res = await fetch(`${BACKEND_URL}/api/current`, {
+        signal: controller.signal,
+        headers: {
+          "x-api-token": API_TOKEN
+        }
+      })
+      if (!res.ok) {
+        throw new Error(`Backend request failed: ${res.status}`)
+      }
+
+      const data = await res.json()
+      deviceDataCache = data
+      lastDeviceFetchAt = Date.now()
+      consecutiveFetchFailures = 0
+      nextFetchRetryAt = 0
+      return data
+    } catch (err) {
+      consecutiveFetchFailures += 1
+      const backoffMs = Math.min(30000, 2000 * (2 ** (consecutiveFetchFailures - 1)))
+      nextFetchRetryAt = Date.now() + backoffMs
+      throw err
+    } finally {
+      clearTimeout(timeoutHandle)
+    }
+  })()
+
+  try {
+    return await inFlightDeviceFetch
+  } finally {
+    inFlightDeviceFetch = null
+  }
+}
 
 function normalizeMotor(value) {
-if (typeof value === 'boolean') return value
-if (typeof value === 'string') {
-const upper = value.toUpperCase()
-return upper === 'ON' || upper === 'TRUE'
-}
-return false
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const upper = value.toUpperCase()
+    return upper === 'ON' || upper === 'TRUE'
+  }
+  return false
 }
 
-// 🔹 GET WATER LEVEL
 export async function getLatestWaterLevel() {
-if (USE_BACKEND) {
-const res = await fetch(`${BASE_URL}/current`)
-const data = await res.json()
-return { level: data.level }
+  try {
+    const data = await fetchDeviceData()
+    return { level: data.level || 0 }
+  } catch (err) {
+    console.error("Error fetching level:", err)
+    return { level: 0 }
+  }
 }
 
-if (USE_REAL_API) {
-const res = await fetch(`${ESP32_IP}/level`)
-const data = await res.json()
-
-saveToHistory(data.level, data.motor)
-return { level: data.level }
-
-}
-
-await wait(150)
-
-const level = Math.floor(Math.random() * 100)
-const motor = Math.random() > 0.5
-
-saveToHistory(level, motor)
-
-return { level }
-}
-
-// 🔹 GET MOTOR STATUS
 export async function getMotorStatus() {
-if (USE_BACKEND) {
-const res = await fetch(`${BASE_URL}/current`)
-const data = await res.json()
-return { isOn: normalizeMotor(data.motor) }
+  try {
+    const data = await fetchDeviceData()
+    return { isOn: normalizeMotor(data.motor) }
+  } catch (err) {
+    console.error("Error fetching motor:", err)
+    return { isOn: false }
+  }
 }
 
-if (USE_REAL_API) {
-const res = await fetch(`${ESP32_IP}/level`)
-const data = await res.json()
-return { isOn: normalizeMotor(data.motor) }
+export async function getSystemState() {
+  try {
+    const data = await fetchDeviceData()
+    return {
+      level: Number(data.level) || 0,
+      motorOn: normalizeMotor(data.motor)
+    }
+  } catch (err) {
+    console.error("Error fetching system state:", err)
+    return {
+      level: 0,
+      motorOn: false
+    }
+  }
 }
 
-await wait(150)
-return { isOn: Math.random() > 0.5 }
-}
-
-// 🔹 MOTOR CONTROL
 export async function toggleMotorAPI(turnOn) {
-if (USE_BACKEND) {
-const res = await fetch(`${BASE_URL}/motor/${turnOn ? "on" : "off"}`, {
-method: "POST"
-})
+  try {
+    // 🌐 Cloud backend API call
+    const res = await fetch(`${BACKEND_URL}/api/motor/${turnOn ? "on" : "off"}`, {
+      method: "POST",
+      headers: {
+        "x-api-token": API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    })
 
-if (!res.ok) {
-throw new Error('Failed to toggle motor')
+    const responseText = await res.text()
+    let data = {}
+
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText)
+      } catch {
+        data = { message: responseText }
+      }
+    }
+
+    if (!res.ok || data.success === false) {
+      throw new Error("Motor control failed")
+    }
+
+    await fetchDeviceData({ force: true })
+    return data
+  } catch (err) {
+    console.error("Motor control error:", err)
+    throw err
+  }
 }
 
-return res.json()
-}
-
-if (USE_REAL_API) {
-await fetch(`${ESP32_IP}/motor/${turnOn ? "on" : "off"}`)
-return { success: true }
-}
-
-await wait(100)
-return { success: true }
-}
-
-// 🔹 SAVE DATA (fallback only)
-function saveToHistory(level, motor) {
-historyStore.push({
-level,
-motor: motor ? 'ON' : 'OFF',
-time: new Date()
-})
-
-if (historyStore.length > 50) {
-historyStore.shift()
-}
-}
-
-// 🔹 GET REPORTS
 export async function getReports() {
-if (USE_BACKEND) {
-const res = await fetch(`${BASE_URL}/history`)
-const data = await res.json()
+  try {
+    const data = await fetchDeviceData()
+    const events = Array.isArray(data.log) ? data.log : []
 
-return data.map((item) => {
-const levelValue = Number(item.level)
-const safeLevel = Number.isFinite(levelValue) ? levelValue : 0
-const motorValue = normalizeMotor(item.motor) ? 'ON' : 'OFF'
+    return events.map((item, index) => {
+      const message = String(item)
+      const timeText = message.includes(' - ') ? message.split(' - ')[0] : data.time || '--:--'
+      const note = message.includes(' - ') ? message.split(' - ').slice(1).join(' - ') : message
 
-return {
-id: item._id || item.id,
-date: item.time,
-level: safeLevel,
-motor: motorValue,
-note: safeLevel < 30 ? 'Low level' : safeLevel > 80 ? 'High level' : 'Normal'
-}
-})
-}
-
-await wait(100)
-
-return historyStore.map((item, index) => ({
-id: index,
-date: item.time.toISOString().split('T')[0],
-level: item.level,
-motor: item.motor,
-note: item.level < 30 ? 'Low level' : item.level > 80 ? 'High level' : 'Normal'
-}))
+      return {
+        id: `${timeText}-${index}`,
+        date: timeText,
+        level: Number(data.level) || 0,
+        motor: note.toUpperCase().includes('MOTOR ON') ? 'ON' : note.toUpperCase().includes('MOTOR OFF') ? 'OFF' : normalizeMotor(data.motor) ? 'ON' : 'OFF',
+        note
+      }
+    })
+  } catch (err) {
+    console.error("Reports error:", err)
+    return []
+  }
 }
 
-// 🔹 GET ANALYTICS
 export async function getAnalytics() {
-if (USE_BACKEND) {
-const res = await fetch(`${BASE_URL}/analytics`)
-const data = await res.json()
+  try {
+    const data = await fetchDeviceData()
 
-return {
-avgLevel: Number(data.avgLevel) || 0,
-maxLevel: Number(data.maxLevel) || 0,
-minLevel: Number(data.minLevel) || 0,
-timesMotorOn: Number(data.timesMotorOn) || 0,
-motorRuntime: Number(data.motorRuntime) || 0,
-motorRuntimeCurrent: Number(data.motorRuntimeCurrent) || 0,
-motorRuntimeTotal: Number(data.motorRuntimeTotal) || 0,
-motorRunning: normalizeMotor(data.motorRunning),
-runtimeLog: Array.isArray(data.runtimeLog) ? data.runtimeLog : []
-}
+    const levels = Array.isArray(data.hl)
+      ? data.hl.map((value) => Number(value)).filter((value) => Number.isFinite(value))
+      : []
+
+    const runtimeLog = []
+    const logs = Array.isArray(data.log) ? data.log : []
+    let activeStart = null
+
+    for (const entry of logs) {
+      const text = String(entry)
+      const parts = text.split(' - ')
+      const timestamp = parts.length > 1 ? parts[0] : null
+      const message = parts.length > 1 ? parts.slice(1).join(' - ') : text
+
+      if (!timestamp) continue
+
+      const state = message.toUpperCase()
+      const currentTime = new Date()
+      const [hours, minutes, seconds] = timestamp.split(':').map((value) => Number(value))
+      if ([hours, minutes, seconds].some((value) => Number.isNaN(value))) continue
+      currentTime.setHours(hours, minutes, seconds, 0)
+
+      if (state.includes('MOTOR ON')) {
+        activeStart = currentTime
+      }
+
+      if (state.includes('MOTOR OFF') && activeStart) {
+        const durationSeconds = Math.max(0, Math.round((currentTime.getTime() - activeStart.getTime()) / 1000))
+        runtimeLog.push({
+          startedAt: activeStart.toISOString(),
+          endedAt: currentTime.toISOString(),
+          durationSeconds
+        })
+        activeStart = null
+      }
+    }
+
+    const timesMotorOn = logs.filter((entry) => String(entry).toUpperCase().includes('MOTOR ON')).length
+    const currentRuntime = Number(data.motor) && activeStart
+      ? Math.max(0, Math.round((Date.now() - activeStart.getTime()) / 1000))
+      : 0
+    const lastCompletedRuntime = runtimeLog.length ? runtimeLog[runtimeLog.length - 1].durationSeconds : 0
+    const motorRuntime = Number(data.motor) ? currentRuntime : lastCompletedRuntime
+
+    return {
+      avgLevel: levels.length ? Math.round(levels.reduce((sum, value) => sum + value, 0) / levels.length) : Number(data.level) || 0,
+      maxLevel: levels.length ? Math.max(...levels) : Number(data.level) || 0,
+      minLevel: levels.length ? Math.min(...levels) : Number(data.level) || 0,
+      timesMotorOn,
+      motorRuntime,
+      motorRuntimeCurrent: currentRuntime,
+      motorRuntimeTotal: runtimeLog.reduce((sum, item) => sum + item.durationSeconds, 0) + currentRuntime,
+      motorRunning: normalizeMotor(data.motor),
+      runtimeLog
+    }
+  } catch (err) {
+    console.error("Analytics error:", err)
+    return {
+      avgLevel: 0,
+      maxLevel: 0,
+      minLevel: 0,
+      timesMotorOn: 0,
+      motorRuntime: 0,
+      motorRuntimeCurrent: 0,
+      motorRuntimeTotal: 0,
+      motorRunning: false,
+      runtimeLog: []
+    }
+  }
 }
 
-if (!historyStore.length) {
-return {
-avgLevel: 0,
-maxLevel: 0,
-minLevel: 0,
-timesMotorOn: 0
-}
-}
-
-const levels = historyStore.map(i => i.level)
-
-return {
-avgLevel: Math.round(levels.reduce((a, b) => a + b, 0) / levels.length),
-maxLevel: Math.max(...levels),
-minLevel: Math.min(...levels),
-timesMotorOn: historyStore.filter(i => i.motor === 'ON').length
-}
-}
-
-// 🔹 GET TRENDS
 export function getTrends() {
-return historyStore.slice(-10).map(i => i.level)
+  return [15, 22, 28, 35, 42, 48, 54, 61, 68, 72]
 }

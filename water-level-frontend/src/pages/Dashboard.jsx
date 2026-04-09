@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { getLatestWaterLevel, getMotorStatus, toggleMotorAPI } from '../services/api'
+import { getSystemState, toggleMotorAPI } from '../services/api'
 import TankDisplay from '../components/TankDisplay'
 import MotorControl from '../components/MotorControl'
 
@@ -20,14 +20,11 @@ function Dashboard() {
   // INITIAL LOAD
   useEffect(() => {
     async function loadInitialState() {
-      const [water, motor] = await Promise.all([
-        getLatestWaterLevel(),
-        getMotorStatus(),
-      ])
+      const snapshot = await getSystemState()
 
-      setLevel(water.level)
-      setMotorOn(motor.isOn)
-      setHistory([water.level])
+      setLevel(snapshot.level)
+      setMotorOn(snapshot.motorOn)
+      setHistory([snapshot.level])
     }
 
     loadInitialState()
@@ -36,17 +33,14 @@ function Dashboard() {
   // LIVE POLLING
   useEffect(() => {
     const interval = setInterval(async () => {
-      const [water, motor] = await Promise.all([
-        getLatestWaterLevel(),
-        getMotorStatus(),
-      ])
+      const snapshot = await getSystemState()
 
-      setLevel(water.level)
-      setMotorOn(motor.isOn)
+      setLevel(snapshot.level)
+      setMotorOn(snapshot.motorOn)
 
       setHistory((prev) => [
         ...prev.slice(-9),
-        water.level
+        snapshot.level
       ])
     }, 5000)
 
@@ -73,16 +67,12 @@ function Dashboard() {
     try {
       await toggleMotorAPI(desiredState)
 
-      // Re-sync from backend to avoid UI state drift when requests are delayed.
-      const [water, motor] = await Promise.all([
-        getLatestWaterLevel(),
-        getMotorStatus(),
-      ])
+      const snapshot = await getSystemState()
 
-      const event = motor.isOn ? 'Motor turned ON manually' : 'Motor turned OFF manually'
+      const event = snapshot.motorOn ? 'Motor turned ON manually' : 'Motor turned OFF manually'
 
-      setLevel(water.level)
-      setMotorOn(motor.isOn)
+      setLevel(snapshot.level)
+      setMotorOn(snapshot.motorOn)
       setEvents((old) => [`${generateTimestamp()} - ${event}`, ...old.slice(0, 4)])
     } catch {
       setEvents((old) => [`${generateTimestamp()} - Failed to change motor state`, ...old.slice(0, 4)])
