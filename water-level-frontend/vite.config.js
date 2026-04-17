@@ -5,6 +5,7 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
+    host: '0.0.0.0',
     proxy: {
       '/esp32': {
         target: process.env.VITE_ESP32_TARGET_URL || 'http://192.168.0.101',

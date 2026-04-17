@@ -34,17 +34,46 @@ const requireAuth = (req, res, next) => {
 // 🔥 GLOBAL STATE
 let motorState = false
 
+function normalizeMotor(value) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value === 1
+  if (typeof value === 'string') {
+    const upper = value.toUpperCase()
+    return upper === 'ON' || upper === 'TRUE' || upper === '1'
+  }
+  return false
+}
+
 // Basic response for browser checks
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'smart-tank-backend' })
 })
 
 // 🔹 CURRENT STATUS (for frontend)
-app.get('/api/current', (req, res) => {
-  res.json({
-    motor: motorState,
-    level: 0 // dummy since no sensor
-  })
+app.get('/api/current', async (req, res) => {
+  try {
+    const espRes = await fetch(`${ESP32_IP}/data`)
+    if (!espRes.ok) {
+      throw new Error(`ESP32 /data failed: ${espRes.status}`)
+    }
+
+    const data = await espRes.json()
+    motorState = normalizeMotor(data.motor)
+
+    res.json({
+      ...data,
+      motor: motorState,
+      level: Number(data.level) || 0
+    })
+  } catch (err) {
+    console.log('ESP32 data error:', err.message)
+    res.status(502).json({
+      error: 'ESP32 unreachable',
+      message: err.message,
+      motor: motorState,
+      level: 0
+    })
+  }
 })
 
 // 🔹 HISTORY (still works with DB)
